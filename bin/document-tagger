@@ -1,0 +1,259 @@
+#! /usr/bin/env perl -v
+
+package Factotum::Fourier::Scripts;
+
+use strict;
+use 5.31.0;
+use warnings FATAL => 'all';
+use Data::Dumper;
+use List::Util;
+use English;
+use Module::Load::Conditional qw(check_install);
+use Carp;
+use Getopt::Long;
+
+use constant VERSION    => q(1.1.1);
+use constant FALSE      => 0;
+use constant TRUE       => 1;
+
+my $tag_bin            = q(/opt/local/bin/tag);
+my $uuid_bin           = q(/opt/local/bin/uuid);
+my $verbose            = 0;
+
+my (
+    $uuid_param, $target_file, @found_tags,
+    $doi_uuid_extracted, $single_uuid, $stdout, $stderr, $exit,
+    $return_val, $file_argv, $added_uuid,
+);
+
+CHECK_PREREQUISITES: { ## no critic
+    if (! check_install(module => "Capture::Tiny")) {
+        croak "Capture::Tiny is not available. Aborting."
+    }
+
+    use Capture::Tiny ':all';
+
+    GetOptions(
+        "uuid|u=s"      => \$uuid_param,
+        "file|f=s"      => \$target_file,
+        "verbose|v+"    => \$verbose,
+    );
+} ## no critic
+
+sub create_uuid {
+    ($stdout, $stderr, $exit) = Capture::Tiny::capture {
+      system( $uuid_bin, q(-o), q(-s) );
+    };
+
+    if ($exit != 0) {
+        croak($!);
+    }
+
+    chomp $stdout;
+
+    verbose_out(Dumper({
+        'stdout' => $stdout,
+        'stderr' => $stderr,
+        'exit-val' =>  $exit,
+    }));
+
+    return $stdout;
+}
+
+sub add_tag {
+    my $tag = shift;
+    my $target_file = shift;
+
+    ($stdout, $stderr, $exit) = capture {
+      system( $tag_bin, (q(-a), qq($tag), qq($target_file)) );
+    };
+
+    if ($exit != 0) {
+        croak($!);
+    }
+
+    say Dumper({
+        'stdout' => $stdout,
+        'stderr' => $stderr,
+        'exit-val' =>  $exit,
+    })  if $verbose;
+
+    return $exit;
+}
+
+sub remove_tag {
+    my $tag = shift;
+    my $target_file = shift;
+
+    ($stdout, $stderr, $exit) = capture {
+      system( $tag_bin, (q(-r), qq($tag), qq($target_file)) );
+    };
+
+    if ($exit != 0) {
+        croak($!);
+    }
+
+    say Dumper({
+        'stdout' => $stdout,
+        'stderr' => $stderr,
+        'exit-val' =>  $exit,
+    })  if $verbose;
+
+    return $exit;
+}
+
+sub clean_tag {
+    my $tag = shift;
+    $tag =~ s/[^a-zA-Z0-9\,\-]//g;
+    return $tag;
+}
+
+sub verbose_out {
+    my $message = shift || FALSE;
+    if ($verbose && $message) {
+        say STDERR '[VERBOSE] ', $message;
+    }
+}
+
+CHECK_FILE_PATH: {
+    $file_argv = pop @ARGV;
+    my $argv_used = FALSE;
+
+    if (!defined($target_file) && defined($file_argv)) {
+        $target_file = $file_argv;
+        $argv_used = TRUE;
+    }
+
+    if (!defined($target_file)) {
+        croak('No filename whatsoever given, use -f or as an argument');
+    }
+
+    if (! -e $target_file) {
+        croak("File '$target_file' was not found. Aborting.");
+    }
+
+    verbose_out("Operation on file '$target_file'." . (($argv_used) ? ' ARGV was used!' : ''));
+    verbose_out();
+}
+
+
+FIND_EXISTING_UUID: {
+    ($stdout, $stderr, $exit) = capture {
+      system( $tag_bin, (q(-0), (-N), q(-l), q(-G), qq($target_file)) );
+    };
+
+    if ($exit != 0) {
+        last;
+    }
+
+    if ($stdout ne q()) {
+        @found_tags = split /,/, $stdout;
+    }
+
+    if (scalar @found_tags == 0) {
+        last;
+    }
+
+    # uuid:938dd63d-3b68-4d1c-9dcb-41fe23c416a4
+    if (List::Util::any { /^uuid\:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i } @found_tags) {
+        my $struct_uuid_found = List::Util::first { /^uuid\:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i  } @found_tags;
+        ($doi_uuid_extracted) = $struct_uuid_found =~ /^(?:uuid\:)(.+)$/i;
+        $doi_uuid_extracted = clean_tag($doi_uuid_extracted);
+    }
+
+    # c7596949-24f2-49d8-930e-46cb0d1776d5
+    if (List::Util::any { /^(?!uuid\:)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i } @found_tags) {
+        $single_uuid = List::Util::first { /^(?!uuid\:)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i } @found_tags;
+        $single_uuid = clean_tag($single_uuid);
+    }
+
+    verbose_out("UUID found!");
+    verbose_out("DOI UUID:    '$doi_uuid_extracted'");
+    verbose_out("Single UUID: '$single_uuid'");
+}
+
+ADD_UUID: {
+    if (!defined($doi_uuid_extracted) && !defined($single_uuid)) {
+        verbose_out("No UUID whatsoever was set!");
+
+        if ($uuid_param) {
+            say "Setting provided UUID '$uuid_param'";
+            add_tag($uuid_param, $target_file);
+            last;
+        }
+
+        verbose_out("Generating a new one ...");
+        my $uuid_gen = create_uuid();
+
+        verbose_out("Add single UUID ...");
+        $return_val = add_tag($uuid_gen, $target_file);
+        verbose_out(' ... added!')   if ($return_val == 0);
+        verbose_out(' ... error :(') if ($return_val != 0);
+
+        verbose_out("Add DOI UUID ...");
+        $return_val = add_tag('uuid:' . $uuid_gen, $target_file);
+        verbose_out(' ... added!')   if ($return_val == 0);
+        verbose_out(' ... error :(') if ($return_val != 0);
+
+        # add flag if a uuid was just added, so we can skip some steps
+        $added_uuid = 1;
+    }
+}
+
+FIX_EXISTING_UUID: {
+    if ($added_uuid) {
+        verbose_out("DOI and SINGLE UUID are just added, skip this step");
+        last;
+    }
+
+    if ($doi_uuid_extracted eq $single_uuid) {
+        verbose_out("DOI and SINGLE UUID are identical.");
+        last;
+    }
+
+    if ($single_uuid and !defined($doi_uuid_extracted)) {
+        verbose_out("Adding missing DOI tag 'uuid:$single_uuid' ...");
+        $return_val = add_tag('uuid:' . $single_uuid, $target_file);
+        verbose_out(' ... added!')   if ($return_val == 0);
+        verbose_out(' ... error :(') if ($return_val != 0);
+        last;
+    }
+
+    if ($doi_uuid_extracted and !defined($single_uuid)) {
+        verbose_out("Adding missing single tag '$doi_uuid_extracted' ...");
+        $return_val = add_tag($doi_uuid_extracted, $target_file);
+        verbose_out(' ... added!')   if ($return_val == 0);
+        verbose_out(' ... error :(') if ($return_val != 0);
+        last;
+    }
+
+    if ($single_uuid ne $doi_uuid_extracted) {
+        verbose_out("UUID mismatch!");
+
+        verbose_out("Remove old single uuid '$single_uuid' ...");
+        $return_val = remove_tag($single_uuid, $target_file);
+        verbose_out(' ... removed!') if ($return_val == 0);
+        verbose_out(' ... error :(') if ($return_val != 0);
+
+        verbose_out("Add single uuid from DOI UUID '$doi_uuid_extracted' ...");
+        $return_val = add_tag($doi_uuid_extracted, $target_file);
+        verbose_out(' ... added!')   if ($return_val == 0);
+        verbose_out(' ... error :(') if ($return_val != 0);
+        last;
+    }
+}
+
+VERBOSE: {
+    verbose_out(Dumper({
+        "uuid-param"    => $uuid_param,
+        "file-param"    => $target_file,
+        'file-argv'     => $file_argv,
+        'found-tags'    => \@found_tags,
+        'uuid-old'  => {
+            'single' => $single_uuid,
+            'doi'    => $doi_uuid_extracted,
+        },
+    }));
+}
+
+
